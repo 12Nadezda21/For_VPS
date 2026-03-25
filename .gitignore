@@ -1,0 +1,4 @@
+.DS_Store
+.serena/
+ansible/.vault_pass
+docker/.env
