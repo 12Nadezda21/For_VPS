@@ -1,0 +1,7 @@
+{
+    admin off
+    http_port 80
+    https_port 443
+}
+
+import /etc/caddy/sites/*.conf

@@ -1,0 +1,112 @@
+name: vps-stack
+services:
+  xcaddy: # caddy with caddy-l4 plugin
+    build:
+      context: .
+      dockerfile: Dockerfile_xcaddy
+    image: local/caddy-l4:2.11.2
+    container_name: xcaddy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/sites:/etc/caddy/sites:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    
+  caddy:
+    image: caddy:latest
+    container_name: caddy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/sites:/etc/caddy/sites:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      
+  komari:
+    image: ghcr.io/komari-monitor/komari:latest
+    container_name: komari
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:25774:25774"
+    volumes:
+      - ./komari/data:/app/data
+      
+  openlist:
+    image: openlistteam/openlist:latest
+    container_name: openlist
+    restart: unless-stopped
+    user: "1000:1000"
+    ports:
+      - "127.0.0.1:5244:5244"
+    volumes:
+      - ./openlist/data:/opt/openlist/data
+      - ${HOME}:/mnt/home
+
+  easyimage:
+    image: ddsderek/easyimage:latest
+    container_name: easyimage
+    ports:
+      - '8080:80'
+    environment:
+      - TZ=Asia/Shanghai
+      - PUID=1000
+      - PGID=1000
+      - DEBUG=false
+    volumes:
+      - './easyimage/config:/app/web/config'
+      - './easyimage/i:/app/web/i'
+    restart: unless-stopped
+
+  cliproxyapi:
+    image: eceasy/cli-proxy-api:latest
+    container_name: cliproxyapi
+    restart: unless-stopped
+    ports:
+      # Main API strictly bound to localhost (Reverse proxy via Caddy) 
+      # If need OAuth, use SSH tunnel -L flag
+      - "127.0.0.1:8317:8317"
+      # Callback ports restricted to localhost for secure SSH tunneling
+      - "127.0.0.1:8085:8085"     # Gemini Callback
+      - "127.0.0.1:1455:1455"     # Codex Callback
+      - "127.0.0.1:54545:54545"   # Claude Callback
+      - "127.0.0.1:51121:51121"   # Qwen / Antigravity Callback
+      - "127.0.0.1:11451:11451"   # iFlow Callback
+    volumes:
+      - ./cliproxyapi/config.yaml:/CLIProxyAPI/config.yaml
+      - ./cliproxyapi/auths:/root/.cli-proxy-api
+      - ./cliproxyapi/logs:/CLIProxyAPI/logs
+  
+  sub-store:
+    image: xream/sub-store:http-meta
+    container_name: sub-store
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SUB_STORE_BACKEND_API_HOST: 127.0.0.1
+      SUB_STORE_BACKEND_API_PORT: 3001
+      SUB_STORE_BACKEND_MERGE: true
+      SUB_STORE_FRONTEND_BACKEND_PATH: /QGsKd6DLNzonV9WJ2ViZQhZH6kW9BgyPo58aKxXWcYkWasnfbBq0NuBMH0J1DE4Y
+      # HTTP-META 的, 一般不用改
+      PORT: 9876
+      HOST: 127.0.0.1
+    volumes:
+      - ./sub-store/data:/opt/app/data
+  
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: unless-stopped
+    environment:
+      DOMAIN: "https://vaultwarden.example.com" # "https://vw.domain.tld"
+      ADMIN_TOKEN: ${VAULTWARDEN_ADMIN_TOKEN}
+    volumes:
+      - ./vaultwarden/data/:/data/
+    ports:
+      - 127.0.0.1:8000:80
+
+volumes:
+  caddy_data:
+  caddy_config:

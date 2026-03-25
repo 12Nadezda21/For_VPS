@@ -1,0 +1,8 @@
+
+{{ caddy_example_domains.cliproxyapi | default('cliproxyapi.example.com') }}:443 {
+    # 1. Rewrite ONLY the exact root path to the management page
+    rewrite / /management.html
+
+    # 2. Proxy absolutely everything to your backend
+    reverse_proxy 127.0.0.1:8317
+}

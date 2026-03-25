@@ -1,0 +1,15 @@
+{
+    servers :443 {
+        listener_wrappers {
+            layer4 {
+                @reality tls sni example.com
+                route @reality {
+                    proxy tcp/127.0.0.1:25102 # for xray or singbox backend
+                }
+            }
+            tls
+        }
+    }
+}
+
+import /etc/caddy/sites/*.conf

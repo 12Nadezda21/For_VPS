@@ -1,0 +1,24 @@
+# Edit domain first, then copy to sub-store.conf and reload Caddy.
+# Reload command:
+# cd /srv/compose && (docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile || docker compose exec xcaddy caddy reload --config /etc/caddy/Caddyfile)
+
+# no auth
+{{ caddy_example_domains['sub-store'] | default('sub-store.example.com') }} {
+        reverse_proxy 127.0.0.1:3001
+}
+
+# with basic auth
+# {{ caddy_example_domains['sub-store'] | default('sub-store.example.com') }} {
+#     @public path /QGsKd6DLNzonV9WJ2ViZQhZH6kW9BgyPo58aKxXWcYkWasnfbBq0NuBMH0J1DE4Y
+
+#     handle @public {
+#         reverse_proxy 127.0.0.1:3001
+#     }
+
+#     handle {
+#         basic_auth {
+#             john $2a$14$bUpkc5qAwPfpYQH8VWBXmeL3nZyQoub69x/3bRIHT44xz74mmkcby
+#         }
+#         reverse_proxy 127.0.0.1:3001
+#     }
+# }

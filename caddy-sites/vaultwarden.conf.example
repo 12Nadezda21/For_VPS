@@ -1,0 +1,7 @@
+# Edit domain first, then copy to vaultwarden.conf and reload Caddy.
+# Reload command:
+# cd /srv/compose && (docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile || docker compose exec xcaddy caddy reload --config /etc/caddy/Caddyfile)
+
+{{ caddy_example_domains.vaultwarden | default('vaultwarden.example.com') }}:443 {
+    reverse_proxy 127.0.0.1:8000
+}

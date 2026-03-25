@@ -1,0 +1,3 @@
+{{ caddy_example_domains.openclaw | default('openclaw.example.com') }} {
+    reverse_proxy 127.0.0.1:18789
+}
