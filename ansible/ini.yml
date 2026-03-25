@@ -1,0 +1,652 @@
+- name: VPS init bootstrap (Play A)
+  hosts: all
+  become: true
+  gather_facts: false
+  remote_user: root
+  vars_files:
+    - vars.yml
+    - vault.yml
+  vars:
+    bootstrap_sudoers_file: "/etc/sudoers.d/{{ new_user }}-bootstrap-nopasswd"
+    ansible_port: "{{ bootstrap_root_port }}"
+    ansible_password: "{{ bootstrap_root_password }}"
+
+  pre_tasks:
+    - name: Ensure Ansible remote_tmp exists
+      ansible.builtin.raw: mkdir -p /root/.ansible/tmp && chmod 0700 /root/.ansible/tmp
+      changed_when: false
+
+    - name: Stop apt-daily services to release dpkg lock
+      ansible.builtin.raw: |
+        set -e
+        systemctl stop apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer unattended-upgrades.service 2>/dev/null || true
+      changed_when: false
+
+    - name: Wait for apt/dpkg locks to clear (cloud-init/unattended-upgrades)
+      ansible.builtin.raw: |
+        set -e
+        for i in $(seq 1 100); do
+          if pgrep -x unattended-upgr >/dev/null 2>&1 \
+            || pgrep -x apt >/dev/null 2>&1 \
+            || pgrep -x apt-get >/dev/null 2>&1 \
+            || pgrep -x dpkg >/dev/null 2>&1; then
+            echo "apt/dpkg busy, waiting... (${i}/100)"
+            sleep 3
+          else
+            exit 0
+          fi
+        done
+        echo "apt/dpkg still busy after waiting" >&2
+        exit 1
+      changed_when: false
+
+    - name: Bootstrap Python and sudo
+      ansible.builtin.raw: apt-get update -qq && apt-get install -y python3 sudo
+      changed_when: false
+
+  tasks:
+    - name: Ensure docker group exists
+      ansible.builtin.group:
+        name: docker
+        state: present
+
+    - name: Create user
+      ansible.builtin.user:
+        name: "{{ new_user }}"
+        shell: /bin/bash
+        groups: sudo,docker
+        append: true
+        password: "{{ vault_user_password | password_hash('sha512') }}"
+        state: present
+
+    - name: Create .ssh directory
+      ansible.builtin.file:
+        path: "/home/{{ new_user }}/.ssh"
+        state: directory
+        owner: "{{ new_user }}"
+        group: "{{ new_user }}"
+        mode: "0700"
+
+    - name: Write authorized_keys
+      ansible.builtin.copy:
+        dest: "/home/{{ new_user }}/.ssh/authorized_keys"
+        owner: "{{ new_user }}"
+        group: "{{ new_user }}"
+        mode: "0600"
+        content: |
+          {{ ssh_pubkeys | join('\n') }}
+
+    - name: Grant temporary passwordless sudo for bootstrap
+      ansible.builtin.copy:
+        dest: "{{ bootstrap_sudoers_file }}"
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+        content: |
+          {{ new_user }} ALL=(ALL) NOPASSWD:ALL
+
+- name: VPS init configure (Play B)
+  hosts: all
+  become: true
+  gather_facts: false
+  remote_user: "{{ new_user }}"
+  vars_files:
+    - vars.yml
+    - vault.yml
+  vars:
+    bootstrap_sudoers_file: "/etc/sudoers.d/{{ new_user }}-bootstrap-nopasswd"
+    ansible_port: "{{ bootstrap_root_port }}"
+    ansible_password: "{{ vault_user_password }}"
+
+  pre_tasks:
+    - name: Gather facts
+      ansible.builtin.setup:
+
+  tasks:
+    - name: Prevent SSH from accepting client locales (Bypass RAM limit)
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?AcceptEnv\s+LANG\s+LC_\*'
+        line: '#AcceptEnv LANG LC_*'
+        state: present
+        backup: true
+      notify: Restart ssh
+
+    - name: Set lightweight C.UTF-8 fallback locale
+      ansible.builtin.copy:
+        dest: /etc/default/locale
+        mode: "0644"
+        content: |
+          LANG="C.UTF-8"
+          LC_ALL="C.UTF-8"
+
+    - name: Disable unattended-upgrades
+      ansible.builtin.service:
+        name: unattended-upgrades
+        enabled: false
+        state: stopped
+      failed_when: false
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages in small batches (avoid OOM on low-memory VPS)
+      ansible.builtin.apt:
+        name: "{{ item }}"
+        state: present
+        install_recommends: false
+      loop:
+        - ["sudo", "cron", "make", "openssh-server", "ufw", "fail2ban"]
+        - ["wget", "curl", "unzip", "zip", "vim", "git", "jq", "tree", "ripgrep"]
+        - ["iproute2", "net-tools", "lsof", "ca-certificates", "gnupg", "openssl"]
+        - ["tmux", "rsync", "htop", "btop", "mtr", "speedtest-cli", "nethogs", "vnstat", "iftop"]
+      loop_control:
+        label: "{{ item | join(', ') }}"
+
+    - name: Limit systemd journal size to 1G
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/journald.conf
+        regexp: '^#?\s*SystemMaxUse='
+        line: 'SystemMaxUse=1G'
+        insertafter: '^\[Journal\]'
+        state: present
+        backup: true
+      notify: Restart systemd-journald
+
+    - name: Install RClone via apt (preferred)
+      ansible.builtin.apt:
+        name: rclone
+        state: present
+        install_recommends: false
+      failed_when: false
+
+    - name: Check rclone binary
+      ansible.builtin.stat:
+        path: /usr/bin/rclone
+      register: rclone_stat
+
+    - name: Install RClone via official script (fallback)
+      ansible.builtin.shell: |
+        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120 https://rclone.org/install.sh | bash
+      args:
+        executable: /bin/bash
+        creates: /usr/bin/rclone
+      timeout: 300
+      when: not rclone_stat.stat.exists
+
+    - name: Configure Rclone WebDAV remote
+      ansible.builtin.shell: |
+        rclone config delete "{{ rclone_remote_name }}" >/dev/null 2>&1 || true
+        rclone config create "{{ rclone_remote_name }}" webdav \
+          url "{{ webdav_url }}" \
+          user "{{ webdav_user }}" \
+          pass "$(rclone obscure '{{ vault_webdav_password }}')" \
+          vendor "other"
+      become: false
+      changed_when: false
+
+    - name: Add Docker GPG key
+      ansible.builtin.shell: |
+        . /etc/os-release
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/${ID}/gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        executable: /bin/bash
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker apt repo
+      ansible.builtin.shell: |
+        . /etc/os-release
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+          https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
+          > /etc/apt/sources.list.d/docker.list
+      args:
+        executable: /bin/bash
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: Update apt cache after adding Docker repo
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Docker v2
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Enable Docker
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Enable containerd
+      ansible.builtin.service:
+        name: containerd
+        enabled: true
+        state: started
+
+    - name: Configure user Vim profile (no sudo)
+      become: false
+      block:
+        - name: Create vim autoload directory
+          ansible.builtin.file:
+            path: "/home/{{ new_user }}/.vim/autoload"
+            state: directory
+            mode: "0755"
+
+        - name: Create vim plugged directory
+          ansible.builtin.file:
+            path: "/home/{{ new_user }}/.vim/plugged"
+            state: directory
+            mode: "0755"
+
+        - name: Download vim-plug
+          ansible.builtin.get_url:
+            url: https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+            dest: "/home/{{ new_user }}/.vim/autoload/plug.vim"
+            mode: "0644"
+
+        - name: Copy .vimrc
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/.vimrc"
+            dest: "/home/{{ new_user }}/.vimrc"
+            mode: "0644"
+
+        - name: Install Vim plugins
+          ansible.builtin.command:
+            argv:
+              - vim
+              - -N
+              - -es
+              - -u
+              - /home/{{ new_user }}/.vimrc
+              - -c
+              - PlugClean!
+              - -c
+              - PlugInstall --sync
+              - -c
+              - qa
+          environment:
+            HOME: "/home/{{ new_user }}"
+          changed_when: false
+          failed_when: false
+
+        - name: Ensure OneDark colorscheme plugin is present
+          ansible.builtin.git:
+            repo: https://github.com/joshdick/onedark.vim.git
+            dest: "/home/{{ new_user }}/.vim/plugged/onedark.vim"
+            update: true
+
+    - name: Enable BBR
+      ansible.builtin.shell: |
+        echo 'net.ipv4.tcp_congestion_control=bbr' > /etc/sysctl.d/99-bbr.conf
+        sysctl -p /etc/sysctl.d/99-bbr.conf
+        if sysctl net.core.default_qdisc >/dev/null 2>&1; then
+          echo 'net.core.default_qdisc=fq' >> /etc/sysctl.d/99-bbr.conf
+          sysctl -w net.core.default_qdisc=fq
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Allow SSH port in UFW
+      ansible.builtin.command: "ufw allow {{ ssh_port }}/tcp"
+      changed_when: false
+
+    - name: Allow common web ports in UFW
+      ansible.builtin.command: "ufw allow {{ item }}/tcp"
+      loop:
+        - "80"
+        - "443"
+      changed_when: false
+
+    - name: Set UFW default deny incoming
+      ansible.builtin.command: ufw default deny incoming
+      changed_when: false
+
+    - name: Set UFW default allow outgoing
+      ansible.builtin.command: ufw default allow outgoing
+      changed_when: false
+
+    - name: Enable UFW
+      ansible.builtin.command: ufw --force enable
+      changed_when: false
+
+    - name: Write fail2ban config
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        mode: "0644"
+        content: |
+          [DEFAULT]
+          bantime = {% if fail2ban_profile == 'strict' %}{{ ban_years_strict | int * 365 * 24 * 3600 }}{% else %}{{ fail2ban_bantime_normal }}{% endif %}
+          findtime = 10m
+          maxretry = {% if fail2ban_profile == 'strict' %}3{% else %}5{% endif %}
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+
+          {% if fail2ban_profile == 'strict' %}
+          [recidive]
+          enabled = true
+          bantime = {{ ban_years_strict | int * 365 * 24 * 3600 }}
+          findtime = 1d
+          maxretry = 3
+          {% endif %}
+      notify: Restart fail2ban
+
+    - name: Enable fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    - name: Create compose root
+      ansible.builtin.file:
+        path: "{{ compose_root }}"
+        state: directory
+        owner: "{{ new_user }}"
+        group: "{{ new_user }}"
+        mode: "0755"
+
+    - name: Create caddy sites dir inside compose root
+      ansible.builtin.file:
+        path: "{{ compose_root }}/caddy/sites"
+        state: directory
+        owner: "{{ new_user }}"
+        group: "{{ new_user }}"
+        mode: "0755"
+
+    - name: Write ops defaults config (base run)
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/ops_defaults.env.j2"
+        dest: "{{ compose_root }}/ops_defaults.env"
+        owner: "{{ new_user }}"
+        group: "{{ new_user }}"
+        mode: "0644"
+      become: false
+
+
+    - name: Step 2 sync docker source to compose root (overwrite)
+      tags: [sync_docker]
+      become: false
+      block:
+        - name: Check if compose root exists before sync
+          ansible.builtin.stat:
+            path: "{{ compose_root }}"
+          register: compose_root_stat
+
+        - name: Check existing subdirectories in compose root
+          ansible.builtin.find:
+            paths: "{{ compose_root }}"
+            recurse: false
+            file_type: directory
+          register: compose_root_subdirs
+          when: compose_root_stat.stat.exists | default(false)
+
+        - name: Decide Step 2 sync mode
+          ansible.builtin.set_fact:
+            sync_root_only: "{{ (compose_root_stat.stat.exists | default(false)) and ((compose_root_subdirs.matched | default(0) | int) > 0) }}"
+
+        - name: Ensure compose root exists for sync
+          ansible.builtin.file:
+            path: "{{ compose_root }}"
+            state: directory
+            mode: "0755"
+
+        - name: Ensure caddy sites dir exists for sync
+          ansible.builtin.file:
+            path: "{{ compose_root }}/caddy/sites"
+            state: directory
+            mode: "0755"
+
+        - name: Write ops defaults config
+          ansible.builtin.template:
+            src: "{{ playbook_dir }}/ops_defaults.env.j2"
+            dest: "{{ compose_root }}/ops_defaults.env"
+            mode: "0644"
+
+        - name: Copy full docker directory to compose root (first sync)
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../docker/"
+            dest: "{{ compose_root }}/"
+            force: true
+          when: not (sync_root_only | bool)
+
+        - name: Copy root-level docker files to compose root (incremental sync)
+          ansible.builtin.copy:
+            src: "{{ item }}"
+            dest: "{{ compose_root }}/{{ item | basename }}"
+            mode: "0644"
+            force: true
+          loop: "{{ query('ansible.builtin.fileglob', playbook_dir + '/../docker/*') + query('ansible.builtin.fileglob', playbook_dir + '/../docker/.*') }}"
+          loop_control:
+            label: "{{ item | basename }}"
+          when:
+            - sync_root_only | bool
+            - item is file
+            - (item | basename) not in ['.', '..', '.DS_Store']
+
+        - name: Copy ops helper scripts to compose root
+          ansible.builtin.copy:
+            src: "{{ item }}"
+            dest: "{{ compose_root }}/{{ item | basename }}"
+            mode: "0644"
+            force: true
+          loop: "{{ query('ansible.builtin.fileglob', playbook_dir + '/../ops_scripts/*.sh') }}"
+          loop_control:
+            label: "{{ item | basename }}"
+
+        - name: Ensure OpenClaw backup log dir
+          ansible.builtin.file:
+            path: "/home/{{ new_user }}/.openclaw/backups"
+            state: directory
+            mode: "0700"
+          when: openclaw_backup_cron_enabled | bool
+
+        - name: Configure OpenClaw backup cron (enabled)
+          ansible.builtin.cron:
+            name: "OpenClaw backup (rclone)"
+            user: "{{ new_user }}"
+            minute: "{{ openclaw_backup_cron_minute }}"
+            hour: "{{ openclaw_backup_cron_hour }}"
+            day: "{{ openclaw_backup_cron_day }}"
+            month: "{{ openclaw_backup_cron_month }}"
+            weekday: "{{ openclaw_backup_cron_weekday }}"
+            job: "/usr/bin/env bash {{ compose_root }}/openclaw_backup.sh >> /home/{{ new_user }}/.openclaw/backups/cron.log 2>&1"
+          when: openclaw_backup_cron_enabled | bool
+
+        - name: Configure OpenClaw backup cron (disabled)
+          ansible.builtin.cron:
+            name: "OpenClaw backup (rclone)"
+            user: "{{ new_user }}"
+            state: absent
+          when: not (openclaw_backup_cron_enabled | bool)
+
+        - name: Apply selected Caddy template as Caddyfile
+          ansible.builtin.copy:
+            src: "{{ compose_root }}/{{ selected_caddy_template | default('Caddyfile.template') }}"
+            dest: "{{ compose_root }}/Caddyfile"
+            remote_src: true
+            mode: "0644"
+
+    - name: Seed caddy site configs from local examples
+      ansible.builtin.template:
+        src: "{{ item }}"
+        dest: "{{ compose_root }}/caddy/sites/{{ item | basename }}"
+        owner: "{{ new_user }}"
+        group: "{{ new_user }}"
+        mode: "0644"
+        force: false
+      loop: "{{ query('ansible.builtin.fileglob', playbook_dir + '/../caddy-sites/*.conf.example') }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      become: false
+      tags: [sync_docker]
+
+    - name: Install zsh and completion packages
+      ansible.builtin.apt:
+        name:
+          - zsh
+          - zsh-autosuggestions
+          - zsh-syntax-highlighting
+        state: present
+
+    - name: Set zsh as default shell for new_user
+      ansible.builtin.user:
+        name: "{{ new_user }}"
+        shell: /bin/zsh
+
+    - name: Configure user shell and tmux profile (no sudo)
+      become: false
+      block:
+        - name: Write .zshenv for global environment variables
+          ansible.builtin.copy:
+            dest: "/home/{{ new_user }}/.zshenv"
+            mode: "0644"
+            content: |
+              if ! infocmp "$TERM" >/dev/null 2>&1; then
+                  export TERM=xterm-256color
+              fi
+              export LANG=C.UTF-8
+              export LC_ALL=C.UTF-8
+
+        - name: Copy default .zshrc from template
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/zshrc.template"
+            dest: "/home/{{ new_user }}/.zshrc"
+            mode: "0644"
+
+        - name: Create tmux config dir
+          ansible.builtin.file:
+            path: "/home/{{ new_user }}/.config/tmux"
+            state: directory
+            mode: "0755"
+
+        - name: Copy tmux.conf
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/tmux.conf"
+            dest: "/home/{{ new_user }}/.config/tmux/tmux.conf"
+            mode: "0644"
+
+        - name: Write ~/.tmux.conf compatibility shim for TPM
+          ansible.builtin.copy:
+            dest: "/home/{{ new_user }}/.tmux.conf"
+            mode: "0644"
+            content: |
+              source-file "/home/{{ new_user }}/.config/tmux/tmux.conf"
+
+        - name: Install TPM
+          ansible.builtin.git:
+            repo: https://github.com/tmux-plugins/tpm
+            dest: "/home/{{ new_user }}/.tmux/plugins/tpm"
+            version: master
+
+        - name: Install tmux plugins via TPM
+          ansible.builtin.shell: |
+            /home/{{ new_user }}/.tmux/plugins/tpm/bin/install_plugins
+          environment:
+            HOME: "/home/{{ new_user }}"
+            TMUX_PLUGIN_MANAGER_PATH: "/home/{{ new_user }}/.tmux/plugins"
+          changed_when: false
+          failed_when: false
+
+  post_tasks:
+    - name: Ensure sshd include exists
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        insertbefore: BOF
+        line: "Include /etc/ssh/sshd_config.d/*.conf"
+        state: present
+        backup: true
+      notify: Restart ssh
+
+    - name: Write SSH hardening config
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-vps-hardening.conf
+        mode: "0644"
+        content: |
+          Port {{ ssh_port }}
+          PermitRootLogin no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          UsePAM yes
+          X11Forwarding no
+          AllowUsers {{ new_user }}
+      notify: Restart ssh
+
+    - name: Flush handlers before removing temporary bootstrap sudo
+      ansible.builtin.meta: flush_handlers
+
+    - name: Revoke temporary passwordless sudo after bootstrap
+      ansible.builtin.file:
+        path: "{{ bootstrap_sudoers_file }}"
+        state: absent
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+           VPS setup complete!
+          ============================================================
+
+           SSH (from now on):
+             ssh -p {{ ssh_port }} {{ new_user }}@<VPS_IP>
+
+          Caddy (Docker Compose):
+            Caddyfile   : {{ compose_root }}/Caddyfile
+            Sites dir   : {{ compose_root }}/caddy/sites/
+            Start       : docker compose up -d caddy (or xcaddy)
+            Reload      : docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile || docker compose exec xcaddy caddy reload --config /etc/caddy/Caddyfile
+            Status      : docker compose ps
+            Logs        : docker logs caddy
+
+           sing-box / Xray (233boy, systemd):
+             Installed on-demand via /srv/compose/proxy_vless.sh
+             Check config : sb list / xray list
+             View all cmds: sb help / xray help
+             Note: use only non-TLS protocols to avoid
+                   233boy conflicting with your Caddy
+
+           Docker services:
+             Copy the docker/ folder to {{ compose_root }} then:
+             cd {{ compose_root }}
+            docker compose up -d caddy komari openlist
+
+           To expose a service via Caddy:
+             1. Create {{ compose_root }}/caddy/sites/<name>.conf:
+                  myapp.example.com {
+                      reverse_proxy 127.0.0.1:PORT
+                  }
+             2. Add DNS A record in Cloudflare → this VPS IP
+             3. Run: docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile || docker compose exec xcaddy caddy reload --config /etc/caddy/Caddyfile
+
+           UFW note:
+             UFW may be inactive on LXC/NAT VPS (kernel restriction).
+             Your firewall is the host NAT in that case — this is normal.
+          ============================================================
+
+  handlers:
+    - name: Restart ssh
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: Restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
+
+    - name: Restart systemd-journald
+      ansible.builtin.service:
+        name: systemd-journald
+        state: restarted

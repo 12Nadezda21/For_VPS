@@ -1,0 +1,7 @@
+# Example static inventory
+#
+# [vps]
+# myserver ansible_host=203.0.113.10 ansible_user=root
+#
+# Or skip inventory entirely and run like:
+# ansible-playbook -i 'YOUR_VPS_IP,' -u root site.yml --ask-vault-pass

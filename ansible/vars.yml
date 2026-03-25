@@ -1,0 +1,88 @@
+# ------------------------------------------------------------------------------
+# Core SSH & User
+# ------------------------------------------------------------------------------
+ssh_port: 42202                # SSH port after hardening
+new_user: "vpsadmin"           # Non-root admin user created by Ansible
+
+# If "yes" and Step 1 is selected while alias already exists in ~/.ssh/config,
+# AllinOne will prompt to run reset-ssh.sh before Step 1.
+step1_prompt_reset_ssh_when_alias_exists: "yes"
+
+# ------------------------------------------------------------------------------
+# Caddy & Domains
+# ------------------------------------------------------------------------------
+caddy_acme_email: "admin@example.com"   # Let's Encrypt email
+caddy_default_engine: "caddy"          # "caddy" or "xcaddy"
+
+# Example domains for caddy-sites/*.conf.example templates
+caddy_example_domains:
+  komari: "komari.example.com"
+  openlist: "openlist.example.com"
+  easyimage: "easyimage.example.com"
+  vaultwarden: "vaultwarden.example.com"
+  cliproxyapi: "cliproxyapi.example.com"
+  sub-store: "sub-store.example.com"
+  openclaw: "openclaw.example.com"
+
+# ------------------------------------------------------------------------------
+# Service Startup (AllinOne Step 3)
+# ------------------------------------------------------------------------------
+# Comma-separated list of services to auto-start in Step 3.
+# Supported values: komari, openlist, easyimage, vaultwarden, cliproxyapi, sub-store
+# Example: "openlist,easyimage,sub-store"
+# If empty, AllinOne will prompt per service.
+service_auto_start: ""
+
+# Default prompt answers when service_auto_start is empty.
+service_default_komari: "n"
+service_default_openlist: "n"
+service_default_easyimage: "n"
+service_default_vaultwarden: "n"
+service_default_cliproxyapi: "n"
+service_default_sub-store: "n"
+
+# ------------------------------------------------------------------------------
+# Proxy Defaults (ops_scripts/proxy_vless.sh)
+# ------------------------------------------------------------------------------
+proxy_uuid: "11111111-1111-1111-1111-111111111111"
+proxy_ws_path: "/ws"
+proxy_reality_short_id: "00000000"
+proxy_default_domain: "example.com"
+proxy_default_ws_domain: "ws.example.com"
+proxy_default_reality_port: "25102"
+
+# ------------------------------------------------------------------------------
+# Backup & Rclone (compose + openclaw)
+# ------------------------------------------------------------------------------
+rclone_remote_name: "remote"             # rclone remote name
+backup_rclone_path_prefix: "Backups"     # compose backup prefix
+backup_cron_schedule: "0 */12 * * *"     # compose backup cron (Step 4)
+
+openclaw_rclone_path_prefix: "Backups/OpenClaw" # OpenClaw backup prefix
+openclaw_backup_cron_enabled: "no"      # enable OpenClaw cron on init, yes or no
+openclaw_backup_cron_minute: "0"
+openclaw_backup_cron_hour: "*/12"
+openclaw_backup_cron_day: "*"
+openclaw_backup_cron_month: "*"
+openclaw_backup_cron_weekday: "*"
+
+# ------------------------------------------------------------------------------
+# Security & Access
+# ------------------------------------------------------------------------------
+ssh_pubkeys:
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockPublicKeyForDocsOnly user@example.com"
+
+# fail2ban_profile controls default ban policy.
+# Possible values: strict, normal
+fail2ban_profile: strict
+ban_years_strict: 2
+fail2ban_bantime_normal: "1d"
+
+# ------------------------------------------------------------------------------
+# Paths & WebDAV
+# ------------------------------------------------------------------------------
+compose_root: /srv/compose
+
+webdav_url: "https://openlist.example.com/dav"
+# webdav_url: "https://openlist.example.net/dav"
+webdav_user: "rclone"

@@ -1,0 +1,5 @@
+# NOTE: This file is intentionally plaintext with placeholders for public use.
+# Replace values before provisioning a real server. You may encrypt it with:
+#   ansible-vault encrypt ansible/vault.yml
+vault_user_password: "CHANGE_ME_STRONG_PASSWORD"
+vault_webdav_password: "CHANGE_ME_WEBDAV_PASSWORD"
